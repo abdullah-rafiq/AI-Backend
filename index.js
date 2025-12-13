@@ -1,67 +1,58 @@
-// index.js
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const fetch = require('node-fetch');
+const fs = require('fs');
+require('dotenv').config();
 
-// 1) Firebase Admin initialization
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// 🔹 Firebase Admin Initialization
 let serviceAccount;
-if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-  // In production: JSON string from env var
+
+if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
+  serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH);
+} else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   try {
     serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-  } catch (e) {
-    console.error('Failed to parse FIREBASE_SERVICE_ACCOUNT env var:', e);
+  } catch (err) {
+    console.error('Failed to parse FIREBASE_SERVICE_ACCOUNT:', err);
     process.exit(1);
   }
 } else {
-  // In local dev: load from file
-  // Make sure serviceAccountKey.json exists next to this file
-  // and comes from Firebase Console -> Service accounts -> Generate new private key
-  // eslint-disable-next-line global-require
-  serviceAccount = require('./serviceAccountKey.json');
+  try {
+    serviceAccount = require('./serviceAccountKey.json');
+  } catch (err) {
+    console.error('Firebase service account not found:', err);
+    process.exit(1);
+  }
 }
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-// 2) Gemini client initialization
-const geminiApiKey = process.env.GEMINI_API_KEY;
-if (!geminiApiKey) {
-  console.error('GEMINI_API_KEY is not set in environment variables.');
+// 🔹 Hugging Face API setup
+const HF_API_KEY = process.env.HUGGINGFACE_API_KEY;
+const HF_MODEL = 'mistral-small'; // Update with full path if needed
+
+if (!HF_API_KEY) {
+  console.error('HUGGINGFACE_API_KEY is not set.');
   process.exit(1);
 }
 
-const genAI = new GoogleGenerativeAI(geminiApiKey);
-// Use a fast model for support assistant
-const supportModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-// PUBLIC health routes (no auth required)
-app.get('/', (req, res) => {
-  res.send('AI support backend is running.');
-});
-
-app.get('/healthz', (req, res) => {
-  res.status(200).send('ok');
-});
-
-// Middleware to verify Firebase ID token (for all routes below)
+// 🔹 Auth middleware
 async function authMiddleware(req, res, next) {
   try {
     const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ')
-      ? authHeader.substring(7)
-      : null;
+    const token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : null;
 
     if (!token) return res.status(401).json({ error: 'No token provided' });
 
     const decoded = await admin.auth().verifyIdToken(token);
-    req.user = decoded; // { uid, email, ... }
+    req.user = decoded;
     next();
   } catch (err) {
     console.error('Auth error:', err);
@@ -69,82 +60,48 @@ async function authMiddleware(req, res, next) {
   }
 }
 
-app.use(authMiddleware);
+// 🔹 Health check
+app.get('/', (req, res) => {
+  res.send('Mistral-Small AI backend running.');
+});
 
-// Helper: call Gemini with a prompt
-async function callLlmForSupport(prompt) {
-  const result = await supportModel.generateContent(prompt);
-  return result.response.text();
+// 🔹 Call Hugging Face Inference API
+async function callMistral(prompt) {
+  const response = await fetch(`https://api-inference.huggingface.co/models/${HF_MODEL}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${HF_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ inputs: prompt }),
+  });
+
+  const data = await response.json();
+
+  if (data.error) throw new Error(data.error);
+  if (Array.isArray(data) && data[0]) return data[0].generated_text || data[0].text || '';
+  return '';
 }
 
-// AI support endpoint (requires Authorization: Bearer <idToken>)
-app.post('/ai/support/ask', async (req, res) => {
+// 🔹 AI support endpoint
+app.post('/ai/support/ask', authMiddleware, async (req, res) => {
   try {
     const uid = req.user.uid;
-    const { message, role = 'customer', language = 'en', threadId } = req.body;
+    const { message } = req.body;
 
-    if (!message || typeof message !== 'string') {
-      return res.status(400).json({ error: 'message required' });
-    }
+    if (!message) return res.status(400).json({ error: 'Message required' });
 
-    // 1) Load user profile
-    const userDoc = await admin.firestore().doc(`users/${uid}`).get();
-    const user = userDoc.data() || {};
+    // Call Mistral-Small
+    const reply = await callMistral(message);
 
-    // 2) Load recent bookings for context (defensive: if no index, just skip)
-    let bookings = [];
-    try {
-      const bookingsSnap = await admin
-        .firestore()
-        .collection('bookings')
-        .where(role === 'customer' ? 'customerId' : 'providerId', '==', uid)
-        .orderBy('createdAt', 'desc')
-        .limit(3)
-        .get();
-
-      bookings = bookingsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    } catch (e) {
-      console.warn('Bookings query failed (maybe missing index):', e.message);
-    }
-
-    // 3) Build prompt for Gemini
-    const prompt = `
-You are a helpful, concise support assistant for a home services app.
-- Answer briefly and clearly.
-- If you refer to bookings, only use the data I provide.
-- If something is unclear, ask the user a short follow-up question.
-
-User role: ${role}
-Preferred language: ${language}
-
-User profile (partial JSON):
-${JSON.stringify(user, null, 2)}
-
-Recent bookings (JSON, newest first):
-${JSON.stringify(bookings, null, 2)}
-
-User message:
-${message}
-`;
-
-    // 4) Call Gemini
-    const reply = await callLlmForSupport(prompt);
-
-    // 5) Store conversation in Firestore
-    const convId =
-      threadId || admin.firestore().collection('support_conversations').doc().id;
-    const convRef = admin.firestore().doc(`support_conversations/${convId}`);
-
-    await convRef.set(
-      {
-        userId: uid,
-        role,
-        lastMessage: reply,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true },
-    );
+    // Store conversation in Firestore
+    const convRef = admin.firestore().collection('support_conversations').doc();
+    await convRef.set({
+      userId: uid,
+      lastMessage: reply,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
 
     await convRef.collection('messages').add({
       sender: 'user',
@@ -158,18 +115,13 @@ ${message}
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    return res.json({
-      threadId: convId,
-      reply,
-      suggestedFollowUps: [],
-    });
+    return res.json({ threadId: convRef.id, reply });
   } catch (err) {
-    console.error('Support endpoint error:', err);
-    return res.status(500).json({ error: 'Server error' });
+    console.error('Support endpoint error:', err.message);
+    return res.status(500).json({ error: err.message });
   }
 });
 
+// 🔹 Start server
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`AI backend listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Mistral backend listening on port ${PORT}`));
