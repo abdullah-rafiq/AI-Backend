@@ -41,7 +41,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Middleware to verify Firebase ID token
+// PUBLIC health routes (no auth required)
+app.get('/', (req, res) => {
+  res.send('AI support backend is running.');
+});
+
+app.get('/healthz', (req, res) => {
+  res.status(200).send('ok');
+});
+
+// Middleware to verify Firebase ID token (for all routes below)
 async function authMiddleware(req, res, next) {
   try {
     const authHeader = req.headers.authorization || '';
@@ -68,7 +77,7 @@ async function callLlmForSupport(prompt) {
   return result.response.text();
 }
 
-// AI support endpoint
+// AI support endpoint (requires Authorization: Bearer <idToken>)
 app.post('/ai/support/ask', async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -158,11 +167,6 @@ ${message}
     console.error('Support endpoint error:', err);
     return res.status(500).json({ error: 'Server error' });
   }
-});
-
-// Health check
-app.get('/', (req, res) => {
-  res.send('AI support backend is running.');
 });
 
 const PORT = process.env.PORT || 8080;
