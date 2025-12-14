@@ -1,5 +1,8 @@
 const express = require('express');
 const cors = require('cors');
+// near the top of your backend file
+const { InferenceClient } = require('@huggingface/inference');
+const hfClient = new InferenceClient(process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN);
 const admin = require('firebase-admin');
 const fetch = require('node-fetch').default;
 const fs = require('fs');
@@ -36,7 +39,8 @@ admin.initializeApp({
 
 //  Hugging Face API setup
 const HF_API_KEY = process.env.HUGGINGFACE_API_KEY;
-const HF_MODEL = 'mistralai/Mistral-7B-Instruct-v0.2';// placeholder
+const HF_MODEL = 'mistralai/Mistral-7B-Instruct-v0.2:featherless-ai';
+
 if (!HF_API_KEY) {
   console.error('HUGGINGFACE_API_KEY is not set.');
   process.exit(1);
@@ -64,39 +68,31 @@ app.get('/', (req, res) => {
   res.send('Mistral-Small AI backend running.');
 });
 
-// Call Hugging Face Inference API
-const HF_BASE_URL = 'https://router.huggingface.co/hf-inference';
-
+// Call Hugging Face Inference API// Use the model you showed from the docs:
 async function callMistral(prompt) {
-  const response = await fetch(`${HF_BASE_URL}/models/${HF_MODEL}`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${HF_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ inputs: prompt }),
+  const completion = await hfClient.chatCompletion({
+    model: HF_MODEL,
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You are a helpful support assistant for the GharAssist mobile app. Answer briefly and clearly.',
+      },
+      {
+        role: 'user',
+        content: prompt,
+      },
+    ],
   });
 
-  const text = await response.text();
+  const choice = completion.choices?.[0];
+  const content = choice?.message?.content;
 
-  if (!response.ok) {
-    throw new Error(
-      `Hugging Face error ${response.status} ${response.statusText}: ${text}`,
-    );
+  if (!content || !content.toString().trim()) {
+    throw new Error('HF chat completion returned empty content');
   }
 
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error(`Hugging Face returned non‑JSON response: ${text}`);
-  }
-
-  if (data.error) throw new Error(data.error);
-  if (Array.isArray(data) && data[0]) {
-    return data[0].generated_text || data[0].text || '';
-  }
-  return '';
+  return content.toString();
 }
 // AI support endpoint
 app.post('/ai/support/ask', authMiddleware, async (req, res) => {

@@ -18,6 +18,7 @@
   },
   "homepage": "https://github.com/abdullah-rafiq/AI-Backend#readme",
   "dependencies": {
+    "@huggingface/inference": "^4.13.5",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
