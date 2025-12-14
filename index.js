@@ -36,8 +36,7 @@ admin.initializeApp({
 
 //  Hugging Face API setup
 const HF_API_KEY = process.env.HUGGINGFACE_API_KEY;
-const HF_MODEL = 'mistral-small'; // Update with full path if needed
-
+const HF_MODEL = process.env.HF_MODEL || 'mistral-small'; // placeholder
 if (!HF_API_KEY) {
   console.error('HUGGINGFACE_API_KEY is not set.');
   process.exit(1);
@@ -66,6 +65,7 @@ app.get('/', (req, res) => {
 });
 
 // Call Hugging Face Inference API
+
 const HF_BASE_URL = 'https://router.huggingface.co/hf-inference';
 async function callMistral(prompt) {
   const response = await fetch(`${HF_BASE_URL}/models/${HF_MODEL}`, {
