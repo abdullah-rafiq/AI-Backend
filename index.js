@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
-const fetch = require('node-fetch');
+const fetch = require('node-fetch').default;
 const fs = require('fs');
 require('dotenv').config();
 
@@ -9,7 +9,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🔹 Firebase Admin Initialization
+//  Firebase Admin Initialization
 let serviceAccount;
 
 if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
@@ -34,7 +34,7 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-// 🔹 Hugging Face API setup
+//  Hugging Face API setup
 const HF_API_KEY = process.env.HUGGINGFACE_API_KEY;
 const HF_MODEL = 'mistral-small'; // Update with full path if needed
 
@@ -43,7 +43,7 @@ if (!HF_API_KEY) {
   process.exit(1);
 }
 
-// 🔹 Auth middleware
+//  Auth middleware
 async function authMiddleware(req, res, next) {
   try {
     const authHeader = req.headers.authorization || '';
@@ -60,12 +60,12 @@ async function authMiddleware(req, res, next) {
   }
 }
 
-// 🔹 Health check
+//  Health check
 app.get('/', (req, res) => {
   res.send('Mistral-Small AI backend running.');
 });
 
-// 🔹 Call Hugging Face Inference API
+// Call Hugging Face Inference API
 async function callMistral(prompt) {
   const response = await fetch(`https://api-inference.huggingface.co/models/${HF_MODEL}`, {
     method: 'POST',
@@ -83,7 +83,7 @@ async function callMistral(prompt) {
   return '';
 }
 
-// 🔹 AI support endpoint
+// AI support endpoint
 app.post('/ai/support/ask', authMiddleware, async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -122,6 +122,6 @@ app.post('/ai/support/ask', authMiddleware, async (req, res) => {
   }
 });
 
-// 🔹 Start server
+//  Start server
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Mistral backend listening on port ${PORT}`));
