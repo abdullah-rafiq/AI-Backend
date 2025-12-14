@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const { InferenceClient } = require('@huggingface/inference');
+const { InferenceClient, HfInference } = require('@huggingface/inference');
 const admin = require('firebase-admin');
 const fetch = require('node-fetch').default;
 require('dotenv').config();
@@ -51,6 +51,7 @@ if (!HF_API_KEY) {
 }
 
 const hfClient = new InferenceClient(HF_API_KEY);
+const hf = new HfInference(HF_API_KEY);
 
 // Main chat / reasoning model (e.g. Llama 3 instruct)
 const HF_CHAT_MODEL = process.env.HF_CHAT_MODEL;
@@ -68,6 +69,12 @@ const HF_IMAGE_MODEL = process.env.HF_IMAGE_MODEL;
 
 // Sentiment model (optional, with chat fallback)
 const HF_SENTIMENT_MODEL = process.env.HF_SENTIMENT_MODEL;
+
+// OCR for CNIC
+const HF_OCR_MODEL = process.env.HF_OCR_MODEL;
+
+// Speech-to-text (e.g. openai/whisper-small)
+const HF_SPEECH_TO_TEXT_MODEL = process.env.HF_SPEECH_TO_TEXT_MODEL;
 
 // -------------------- Auth & Admin Middleware --------------------
 
@@ -614,84 +621,271 @@ Use simple language; if field names are English, answer in English.
   },
 );
 
+// -------------------- Speech-to-Text (audio -> text with meta) --------------------
 
-
-//--------------------
-app.post("/api/vision-analyze", authMiddleware, async (req, res) => {
+app.post('/api/speech-to-text', authMiddleware, async (req, res) => {
   try {
-    const { imageBase64, prompt } = req.body;
+    const { audioBase64 } = req.body;
 
-    if (!process.env.HF_IMAGE_MODEL) {
+    if (!HF_SPEECH_TO_TEXT_MODEL) {
       return res
         .status(500)
-        .json({ error: "HF_IMAGE_MODEL is not configured" });
+        .json({ error: 'HF_SPEECH_TO_TEXT_MODEL is not configured' });
     }
-    if (!process.env.HF_CHAT_MODEL) {
-      return res
-        .status(500)
-        .json({ error: "HF_CHAT_MODEL is not configured" });
-    }
-    if (!imageBase64) {
+
+    if (!audioBase64) {
       return res
         .status(400)
-        .json({ error: "imageBase64 is required (base64-encoded image)" });
+        .json({ error: 'audioBase64 is required (base64-encoded audio)' });
     }
 
-    const imageBuffer = Buffer.from(imageBase64, "base64");
+    const cleanBase64 = audioBase64.includes(',')
+      ? audioBase64.split(',').pop()
+      : audioBase64;
 
-    // 1) Get a caption / description from the image
-    const captionResult = await hf.imageToText({
-      model: process.env.HF_IMAGE_MODEL,
-      data: imageBuffer,
+    const audioBuffer = Buffer.from(cleanBase64, 'base64');
+
+    const result = await hf.automaticSpeechRecognition({
+      model: HF_SPEECH_TO_TEXT_MODEL,
+      data: audioBuffer,
     });
 
-    const caption = captionResult.generated_text ?? "";
+    const transcript = result.text || '';
 
-    // 2) Use Llama 3 to answer based on caption + optional user prompt
-    const userPrompt = (prompt ?? "").trim();
+    // Optional smart meta (language + intent)
+    let meta = null;
+    try {
+      const metaSystemPrompt = `
+You receive a short transcript from a user in a home-services app.
+The text may be English, Urdu, or Roman Urdu.
+Return a JSON object with:
+{
+  "language": "en" | "ur" | "mixed" | "unknown",
+  "intent": "support" | "booking" | "general" | "complaint" | "other",
+  "shortSummary": "1-line summary in same language as user"
+}
+Only output JSON.
+`.trim();
 
-    const systemInstruction = `
-You are a vision assistant for a home services app.
-You understand images and help users and workers with context such as bookings, homes, and issues.
-You must support both English and Urdu. Reply in the same language the user uses when possible.
-    `.trim();
-
-    const combinedPrompt = `
-[Image description]
-${caption || "No detailed caption was produced."}
-
-[User question / instruction]
-${userPrompt || "Explain this image briefly for a general user."}
-
-[Task]
-Based on the image description and the question (if any), provide a helpful, concise answer.
-If you see safety issues or something important for the booking (e.g., damaged appliance, safety hazard), mention it.
-    `.trim();
-
-    const chatResponse = await hf.textGeneration({
-      model: process.env.HF_CHAT_MODEL,
-      inputs: `${systemInstruction}\n\nUser:\n${combinedPrompt}\n\nAssistant:`,
-      parameters: {
-        max_new_tokens: 256,
-        temperature: 0.5,
-        top_p: 0.95,
-      },
-    });
-
-    const answerText = chatResponse.generated_text ?? "";
+      const metaRaw = await callChatModel(metaSystemPrompt, transcript);
+      meta = JSON.parse(metaRaw);
+    } catch (e) {
+      console.warn('STT meta analysis failed:', e);
+    }
 
     return res.json({
-      caption,
-      answer: answerText,
+      text: transcript,
+      meta,
     });
   } catch (err) {
-    console.error("Vision analyze error:", err);
+    console.error('STT /api/speech-to-text error:', err);
     return res.status(500).json({
-      error: "Failed to analyze image",
+      error: 'Failed to transcribe audio',
       details: err?.message ?? String(err),
     });
   }
 });
+
+// -------------------- CNIC Vision Verification --------------------
+
+app.post('/api/vision/verify-cnic', authMiddleware, async (req, res) => {
+  try {
+    const {
+      cnicFrontBase64,
+      cnicBackBase64,
+      expectedName,
+      expectedFatherName,
+      expectedDob, // optional, YYYY-MM-DD
+    } = req.body;
+
+    if (!HF_OCR_MODEL) {
+      return res
+        .status(500)
+        .json({ error: 'HF_OCR_MODEL is not configured' });
+    }
+    if (!HF_CHAT_MODEL) {
+      return res
+        .status(500)
+        .json({ error: 'HF_CHAT_MODEL is not configured' });
+    }
+
+    if (!cnicFrontBase64 || !cnicBackBase64) {
+      return res.status(400).json({
+        error:
+          'cnicFrontBase64 and cnicBackBase64 are required (base64-encoded images)',
+      });
+    }
+
+    const cleanBase64 = (b64) =>
+      b64.includes(',') ? b64.split(',').pop() : b64;
+
+    const frontBuffer = Buffer.from(cleanBase64(cnicFrontBase64), 'base64');
+    const backBuffer = Buffer.from(cleanBase64(cnicBackBase64), 'base64');
+
+    // 1) OCR both sides using an OCR-capable image-to-text model
+    const [frontOcr, backOcr] = await Promise.all([
+      hf.imageToText({
+        model: HF_OCR_MODEL,
+        data: frontBuffer,
+      }),
+      hf.imageToText({
+        model: HF_OCR_MODEL,
+        data: backBuffer,
+      }),
+    ]);
+
+    const frontText = frontOcr?.generated_text ?? '';
+    const backText = backOcr?.generated_text ?? '';
+
+    // 2) Post-process with Llama 3 to get clean JSON
+    const systemPrompt = `
+You are an assistant that parses OCR text from the front and back of a Pakistani CNIC (national ID card).
+The OCR may be noisy or partially wrong. Your job is to normalize it into a single strict JSON object.
+
+Fields to extract (if not visible, set them to null):
+  - fullName: string | null
+  - fatherName: string | null
+  - gender: string | null             // e.g. "M" or "F"
+  - countryOfStay: string | null
+  - cnicNumber: string | null         // formatted like 00000-0000000-0
+  - dateOfBirth: string | null        // ISO YYYY-MM-DD if possible
+  - dateOfIssue: string | null        // ISO YYYY-MM-DD
+  - dateOfExpiry: string | null       // ISO YYYY-MM-DD
+  - addressUrdu: {
+      line1: string | null,
+      line2: string | null,
+      district: string | null,
+      tehsil: string | null
+    }
+  - backReferenceNumber: string | null   // any long numeric code on back
+  - notes: string[]                      // short notes about uncertainty
+
+Consistency checks:
+  - frontBackCnicMatch: boolean | null
+  - likelyValidPakistanCnic: boolean | null
+
+Also compare against any EXPECTED data I provide (expectedName, expectedFatherName, expectedDob).
+Include:
+
+  - expectedMatches: {
+      nameMatchesLikely: number | null,        // 0-1
+      fatherNameMatchesLikely: number | null,  // 0-1
+      dobMatchesLikely: number | null          // 0-1
+    }
+
+Return ONLY a single JSON object with this structure:
+
+{
+  "cnicExtracted": {
+    ...fields above...
+  },
+  "expectedMatches": {
+    ...scores above...
+  }
+}
+`.trim();
+
+    const expectedInfo = `
+Expected (may be null):
+- expectedName: ${expectedName || 'null'}
+- expectedFatherName: ${expectedFatherName || 'null'}
+- expectedDob: ${expectedDob || 'null'}
+`.trim();
+
+    const userPrompt = `
+[OCR_FRONT]
+${frontText}
+
+[OCR_BACK]
+${backText}
+
+${expectedInfo}
+
+Now produce the JSON object described above.
+Do not include any explanation outside JSON.
+`.trim();
+
+    const generation = await hf.textGeneration({
+      model: HF_CHAT_MODEL,
+      inputs: `${systemPrompt}\n\nUser:\n${userPrompt}\n\nAssistant:`,
+      parameters: {
+        max_new_tokens: 512,
+        temperature: 0.2,
+        top_p: 0.9,
+      },
+    });
+
+    const rawOutput = generation?.generated_text ?? '';
+
+    const firstBrace = rawOutput.indexOf('{');
+    const lastBrace = rawOutput.lastIndexOf('}');
+
+    if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+      console.error('verify-cnic: no JSON braces in LLM output:', rawOutput);
+      return res.status(500).json({
+        error: 'Failed to parse CNIC data from model output',
+        rawOutput,
+        ocrFront: frontText,
+        ocrBack: backText,
+      });
+    }
+
+    const jsonSubstring = rawOutput.slice(firstBrace, lastBrace + 1);
+
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonSubstring);
+    } catch (e) {
+      console.error('verify-cnic: JSON.parse error:', e, jsonSubstring);
+      return res.status(500).json({
+        error: 'Failed to parse CNIC JSON from model output',
+        rawOutput,
+        jsonSubstring,
+        ocrFront: frontText,
+        ocrBack: backText,
+      });
+    }
+
+    // Store structured CNIC data under the current user for admin to review
+    try {
+      const uid = req.user && req.user.uid;
+      if (uid && parsed && parsed.cnicExtracted) {
+        const userRef = db.collection('users').doc(uid);
+        await userRef.set(
+          {
+            verification: {
+              cnic: {
+                extracted: parsed.cnicExtracted,
+                expectedMatches: parsed.expectedMatches || null,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+            },
+          },
+          { merge: true },
+        );
+      }
+    } catch (storeErr) {
+      console.error('verify-cnic: failed to store CNIC data:', storeErr);
+      // continue; do not block response to client
+    }
+
+    // Success: send structured result plus raw OCR for debugging if needed
+    return res.json({
+      ...parsed,
+      raw: {
+        ocrFront: frontText,
+        ocrBack: backText,
+      },
+    });
+  } catch (err) {
+    console.error('verify-cnic error:', err);
+    return res.status(500).json({
+      error: 'Internal error in verify-cnic',
+      details: err?.message ?? String(err),
+    });
+  }
+});
+
 // -------------------- Start Server --------------------
 
 const PORT = process.env.PORT || 8080;
