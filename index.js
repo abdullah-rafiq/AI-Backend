@@ -36,7 +36,7 @@ admin.initializeApp({
 
 //  Hugging Face API setup
 const HF_API_KEY = process.env.HUGGINGFACE_API_KEY;
-const HF_MODEL = process.env.HF_MODEL || 'mistral-small'; // placeholder
+const HF_MODEL = 'mistralai/Mistral-7B-Instruct-v0.2';// placeholder
 if (!HF_API_KEY) {
   console.error('HUGGINGFACE_API_KEY is not set.');
   process.exit(1);
@@ -65,8 +65,8 @@ app.get('/', (req, res) => {
 });
 
 // Call Hugging Face Inference API
-
 const HF_BASE_URL = 'https://router.huggingface.co/hf-inference';
+
 async function callMistral(prompt) {
   const response = await fetch(`${HF_BASE_URL}/models/${HF_MODEL}`, {
     method: 'POST',
@@ -76,7 +76,22 @@ async function callMistral(prompt) {
     },
     body: JSON.stringify({ inputs: prompt }),
   });
-  const data = await response.json();
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Hugging Face error ${response.status} ${response.statusText}: ${text}`,
+    );
+  }
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Hugging Face returned non‑JSON response: ${text}`);
+  }
+
   if (data.error) throw new Error(data.error);
   if (Array.isArray(data) && data[0]) {
     return data[0].generated_text || data[0].text || '';
