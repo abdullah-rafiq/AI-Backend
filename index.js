@@ -614,6 +614,84 @@ Use simple language; if field names are English, answer in English.
   },
 );
 
+
+
+//--------------------
+app.post("/api/vision-analyze", authMiddleware, async (req, res) => {
+  try {
+    const { imageBase64, prompt } = req.body;
+
+    if (!process.env.HF_IMAGE_MODEL) {
+      return res
+        .status(500)
+        .json({ error: "HF_IMAGE_MODEL is not configured" });
+    }
+    if (!process.env.HF_CHAT_MODEL) {
+      return res
+        .status(500)
+        .json({ error: "HF_CHAT_MODEL is not configured" });
+    }
+    if (!imageBase64) {
+      return res
+        .status(400)
+        .json({ error: "imageBase64 is required (base64-encoded image)" });
+    }
+
+    const imageBuffer = Buffer.from(imageBase64, "base64");
+
+    // 1) Get a caption / description from the image
+    const captionResult = await hf.imageToText({
+      model: process.env.HF_IMAGE_MODEL,
+      data: imageBuffer,
+    });
+
+    const caption = captionResult.generated_text ?? "";
+
+    // 2) Use Llama 3 to answer based on caption + optional user prompt
+    const userPrompt = (prompt ?? "").trim();
+
+    const systemInstruction = `
+You are a vision assistant for a home services app.
+You understand images and help users and workers with context such as bookings, homes, and issues.
+You must support both English and Urdu. Reply in the same language the user uses when possible.
+    `.trim();
+
+    const combinedPrompt = `
+[Image description]
+${caption || "No detailed caption was produced."}
+
+[User question / instruction]
+${userPrompt || "Explain this image briefly for a general user."}
+
+[Task]
+Based on the image description and the question (if any), provide a helpful, concise answer.
+If you see safety issues or something important for the booking (e.g., damaged appliance, safety hazard), mention it.
+    `.trim();
+
+    const chatResponse = await hf.textGeneration({
+      model: process.env.HF_CHAT_MODEL,
+      inputs: `${systemInstruction}\n\nUser:\n${combinedPrompt}\n\nAssistant:`,
+      parameters: {
+        max_new_tokens: 256,
+        temperature: 0.5,
+        top_p: 0.95,
+      },
+    });
+
+    const answerText = chatResponse.generated_text ?? "";
+
+    return res.json({
+      caption,
+      answer: answerText,
+    });
+  } catch (err) {
+    console.error("Vision analyze error:", err);
+    return res.status(500).json({
+      error: "Failed to analyze image",
+      details: err?.message ?? String(err),
+    });
+  }
+});
 // -------------------- Start Server --------------------
 
 const PORT = process.env.PORT || 8080;
