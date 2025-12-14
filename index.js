@@ -66,8 +66,9 @@ app.get('/', (req, res) => {
 });
 
 // Call Hugging Face Inference API
+const HF_BASE_URL = 'https://router.huggingface.co/hf-inference';
 async function callMistral(prompt) {
-  const response = await fetch(`https://api-inference.huggingface.co/models/${HF_MODEL}`, {
+  const response = await fetch(`${HF_BASE_URL}/models/${HF_MODEL}`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${HF_API_KEY}`,
@@ -75,14 +76,13 @@ async function callMistral(prompt) {
     },
     body: JSON.stringify({ inputs: prompt }),
   });
-
   const data = await response.json();
-
   if (data.error) throw new Error(data.error);
-  if (Array.isArray(data) && data[0]) return data[0].generated_text || data[0].text || '';
+  if (Array.isArray(data) && data[0]) {
+    return data[0].generated_text || data[0].text || '';
+  }
   return '';
 }
-
 // AI support endpoint
 app.post('/ai/support/ask', authMiddleware, async (req, res) => {
   try {
