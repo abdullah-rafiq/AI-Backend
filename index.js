@@ -717,8 +717,12 @@ app.post('/api/vision/verify-cnic', authMiddleware, async (req, res) => {
       });
     }
 
-    const cleanBase64 = (b64) =>
-      b64.includes(',') ? b64.split(',').pop() : b64;
+    const cleanBase64 = (b64Raw) => {
+      if (!b64Raw) return '';
+      const b64 = typeof b64Raw === 'string' ? b64Raw : String(b64Raw);
+      const commaIndex = b64.indexOf(',');
+      return commaIndex !== -1 ? b64.slice(commaIndex + 1) : b64;
+    };
 
     const frontBuffer = Buffer.from(cleanBase64(cnicFrontBase64), 'base64');
     const backBuffer = Buffer.from(cleanBase64(cnicBackBase64), 'base64');
@@ -886,7 +890,6 @@ Do not include any explanation outside JSON.
     });
   }
 });
-
 // -------------------- Start Server --------------------
 
 const PORT = process.env.PORT || 8080;
