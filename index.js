@@ -365,7 +365,24 @@ Language formats:
 - roman_urdu → Roman Urdu only
 `;
 
-    const reply = await callChatModel(SUPPORT_SYSTEM_PROMPT, message);
+    let reply = await callChatModel(SUPPORT_SYSTEM_PROMPT, message);
+
+// 🔒 Enforce language if model disobeys (retry once)
+if (!isReplyInLanguage(reply, language)) {
+  const HARD_OVERRIDE_PROMPT = `
+You MUST reply ONLY in ${language}.
+DO NOT use any other language.
+DO NOT explain.
+DO NOT translate.
+Reply naturally as a customer support agent.
+`;
+
+  reply = await callChatModel(
+    HARD_OVERRIDE_PROMPT,
+    message
+  );
+}
+
 
     const convRef = db.collection('support_conversations').doc();
 
