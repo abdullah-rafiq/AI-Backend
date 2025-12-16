@@ -9,6 +9,28 @@ app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ limit: '20mb', extended: true }));
 app.use(cors());
 app.use(express.json());
+///---function////
+function isReplyInLanguage(text, language) {
+  const t = (text || '').trim();
+  const lang = (language || '').toLowerCase();
+
+  if (!t) return true;
+
+  const hasUrduScript = /[\u0600-\u06FF]/.test(t);
+
+  if (lang === 'urdu') {
+    // Must contain Urdu/Arabic script
+    return hasUrduScript;
+  }
+
+  if (lang === 'english' || lang === 'roman_urdu') {
+    // Must NOT contain Urdu/Arabic script
+    return !hasUrduScript;
+  }
+
+  // Unknown language -> don't block
+  return true;
+}
 
 // -------------------- Firebase Admin Initialization --------------------
 
