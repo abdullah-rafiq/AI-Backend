@@ -281,20 +281,63 @@ async function callSentimentModel(text) {
   return { sentiment, confidence };
 }
 
+// -------------------- Helper Functions --------------------
+
+// Language detection (English / Urdu / Roman Urdu)
+function detectLanguage(text) {
+  if (!text) return 'english';
+
+  // Urdu script
+  if (/[\u0600-\u06FF]/.test(text)) {
+    return 'urdu';
+  }
+
+  // Roman Urdu heuristics
+  const romanUrduWords = [
+    'kya', 'hai', 'hain', 'nahi', 'mein', 'ap', 'aap',
+    'ka', 'ki', 'ko', 'kyun', 'madad', 'please'
+  ];
+
+  const lower = text.toLowerCase();
+  if (romanUrduWords.some((w) => lower.includes(w))) {
+    return 'roman_urdu';
+  }
+
+  return 'english';
+}
+
+// Generic chat helper
+async function callChatModel(systemPrompt, userContent) {
+  const completion = await hfClient.chatCompletion({
+    model: HF_CHAT_MODEL,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent },
+    ],
+  });
+
+  let content = completion.choices?.[0]?.message?.content;
+
+  if (Array.isArray(content)) {
+    content = content.map((p) => p.text || '').join('');
+  }
+
+  if (!content || !content.trim()) {
+    throw new Error('Chat model returned empty content');
+  }
+
+  return content.toString();
+}
+
 // -------------------- Health Check --------------------
 
 app.get('/', (req, res) => {
   res.send('AI backend for GharAssist is running.');
 });
 
-// -------------------- AI Endpoints (User-facing) --------------------
+// -------------------- AI Endpoints --------------------
 
-// 1) Support / general chat
-const SUPPORT_SYSTEM_PROMPT =
-  'You are a helpful support assistant for the GharAssist app. ' +
-  'Users may speak English, Urdu, or Roman Urdu. ' +
-  'Reply briefly, clearly, and in the same language the user mostly used.';
-
+// 1) Support / general chat (LANGUAGE LOCKED)
 app.post('/ai/support/ask', authMiddleware, async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -304,14 +347,32 @@ app.post('/ai/support/ask', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Message required' });
     }
 
+    const language = detectLanguage(message);
+
+    const SUPPORT_SYSTEM_PROMPT = `
+You are a customer support agent for the GharAssist app.
+
+STRICT RULES:
+- Respond ONLY in ${language}
+- Do NOT mix languages
+- Do NOT translate
+- Keep replies short and helpful
+- Talk like a real customer support agent
+
+Language formats:
+- english → English only
+- urdu → اردو رسم الخط میں
+- roman_urdu → Roman Urdu only
+`;
+
     const reply = await callChatModel(SUPPORT_SYSTEM_PROMPT, message);
 
-    // Store a minimal conversation record in Firestore
     const convRef = db.collection('support_conversations').doc();
 
     await convRef.set({
       userId: uid,
       lastMessage: reply,
+      language,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -319,12 +380,14 @@ app.post('/ai/support/ask', authMiddleware, async (req, res) => {
     await convRef.collection('messages').add({
       sender: 'user',
       text: message,
+      language,
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     await convRef.collection('messages').add({
       sender: 'ai',
       text: reply,
+      language,
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
     });
 
