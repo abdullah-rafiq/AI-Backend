@@ -3,6 +3,8 @@ const cors = require('cors');
 const { InferenceClient, HfInference } = require('@huggingface/inference');
 const admin = require('firebase-admin');
 const fetch = require('node-fetch').default;
+const { spawn } = require('child_process');
+const path = require('path');
 require('dotenv').config();
 const app = express();
 app.use(express.json({ limit: '20mb' }));
@@ -137,6 +139,54 @@ async function requireAdminRole(req, res, next) {
 }
 
 // -------------------- Helper Functions --------------------
+
+// -------------------- Python Bridge (Run on Hugging Face Space) --------------------
+
+async function runKycEngine(action, args = {}) {
+  const KYC_API_URL = process.env.KYC_API_URL;
+  if (!KYC_API_URL) {
+    throw new Error("KYC_API_URL is not configured.");
+  }
+
+  // Map action to endpoint
+  let endpoint = '';
+  let body = {};
+
+  if (action === 'cnic') {
+    endpoint = '/verify-cnic';
+    body = { image: args.image };
+  } else if (action === 'face') {
+    endpoint = '/face-verify';
+    body = { image1: args.image, image2: args.image2 };
+  } else if (action === 'shop') {
+    endpoint = '/shop-verify';
+    body = { image: args.image };
+  } else {
+    throw new Error(`Unknown action: ${action}`);
+  }
+
+  // Clean URL
+  const baseUrl = KYC_API_URL.endsWith('/') ? KYC_API_URL.slice(0, -1) : KYC_API_URL;
+  const url = `${baseUrl}${endpoint}`;
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`KYC Service Error (${response.status}): ${errText}`);
+    }
+
+    return await response.json();
+  } catch (e) {
+    console.error("KYC Bridge Error:", e);
+    throw e;
+  }
+}
 
 // Generic chat helper (Llama 3 / instruct model)
 async function callChatModel(systemPrompt, userContent) {
@@ -389,9 +439,9 @@ Language formats:
 
     let reply = await callChatModel(SUPPORT_SYSTEM_PROMPT, message);
 
-// 🔒 Enforce language if model disobeys (retry once)
-if (!isReplyInLanguage(reply, language)) {
-  const HARD_OVERRIDE_PROMPT = `
+    // 🔒 Enforce language if model disobeys (retry once)
+    if (!isReplyInLanguage(reply, language)) {
+      const HARD_OVERRIDE_PROMPT = `
 You MUST reply ONLY in ${language}.
 DO NOT use any other language.
 DO NOT explain.
@@ -399,11 +449,11 @@ DO NOT translate.
 Reply naturally as a customer support agent.
 `;
 
-  reply = await callChatModel(
-    HARD_OVERRIDE_PROMPT,
-    message
-  );
-}
+      reply = await callChatModel(
+        HARD_OVERRIDE_PROMPT,
+        message
+      );
+    }
 
 
     const convRef = db.collection('support_conversations').doc();
@@ -793,203 +843,69 @@ Only output JSON.
 
 app.post('/api/vision/verify-cnic', authMiddleware, async (req, res) => {
   try {
-    const {
-      cnicFrontBase64,
-      cnicBackBase64,
-      expectedName,
-      expectedFatherName,
-      expectedDob, // optional, YYYY-MM-DD
-    } = req.body;
-
-    if (!HF_OCR_MODEL) {
-      return res
-        .status(500)
-        .json({ error: 'HF_OCR_MODEL is not configured' });
-    }
-    if (!HF_CHAT_MODEL) {
-      return res
-        .status(500)
-        .json({ error: 'HF_CHAT_MODEL is not configured' });
+    const { cnicFrontBase64 } = req.body; // We focus on front now for extraction
+    if (!cnicFrontBase64) {
+      return res.status(400).json({ error: 'cnicFrontBase64 is required' });
     }
 
-    if (!cnicFrontBase64 || !cnicBackBase64) {
-      return res.status(400).json({
-        error:
-          'cnicFrontBase64 and cnicBackBase64 are required (base64-encoded images)',
-      });
+    console.log("Processing CNIC via Local Engine...");
+    const result = await runKycEngine('cnic', { image: cnicFrontBase64 });
+
+    // Save to DB logic (preserving previous pattern of saving to user doc if needed)
+    if (req.user && req.user.uid) {
+      try {
+        const userRef = db.collection('users').doc(req.user.uid);
+        await userRef.set({
+          verification: {
+            cnic: {
+              extracted: result,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            }
+          }
+        }, { merge: true });
+      } catch (e) { console.error("Error saving CNIC data:", e); }
     }
 
-    const cleanBase64 = (b64Raw) => {
-      if (!b64Raw) return '';
-      const b64 = typeof b64Raw === 'string' ? b64Raw : String(b64Raw);
-      const commaIndex = b64.indexOf(',');
-      return commaIndex !== -1 ? b64.slice(commaIndex + 1) : b64;
-    };
-
-    const frontBuffer = Buffer.from(cleanBase64(cnicFrontBase64), 'base64');
-    const backBuffer = Buffer.from(cleanBase64(cnicBackBase64), 'base64');
-
-    // 1) OCR both sides using an OCR-capable image-to-text model
-    const [frontOcr, backOcr] = await Promise.all([
-      hf.imageToText({
-        model: HF_OCR_MODEL,
-        data: frontBuffer,
-      }),
-      hf.imageToText({
-        model: HF_OCR_MODEL,
-        data: backBuffer,
-      }),
-    ]);
-
-    const frontText = frontOcr?.generated_text ?? '';
-    const backText = backOcr?.generated_text ?? '';
-
-    // 2) Post-process with Llama 3 to get clean JSON
-    const systemPrompt = `
-You are an assistant that parses OCR text from the front and back of a Pakistani CNIC (national ID card).
-The OCR may be noisy or partially wrong. Your job is to normalize it into a single strict JSON object.
-
-Fields to extract (if not visible, set them to null):
-  - fullName: string | null
-  - fatherName: string | null
-  - gender: string | null             // e.g. "M" or "F"
-  - countryOfStay: string | null
-  - cnicNumber: string | null         // formatted like 00000-0000000-0
-  - dateOfBirth: string | null        // ISO YYYY-MM-DD if possible
-  - dateOfIssue: string | null        // ISO YYYY-MM-DD
-  - dateOfExpiry: string | null       // ISO YYYY-MM-DD
-  - addressUrdu: {
-      line1: string | null,
-      line2: string | null,
-      district: string | null,
-      tehsil: string | null
-    }
-  - backReferenceNumber: string | null   // any long numeric code on back
-  - notes: string[]                      // short notes about uncertainty
-
-Consistency checks:
-  - frontBackCnicMatch: boolean | null
-  - likelyValidPakistanCnic: boolean | null
-
-Also compare against any EXPECTED data I provide (expectedName, expectedFatherName, expectedDob).
-Include:
-
-  - expectedMatches: {
-      nameMatchesLikely: number | null,        // 0-1
-      fatherNameMatchesLikely: number | null,  // 0-1
-      dobMatchesLikely: number | null          // 0-1
-    }
-
-Return ONLY a single JSON object with this structure:
-
-{
-  "cnicExtracted": {
-    ...fields above...
-  },
-  "expectedMatches": {
-    ...scores above...
-  }
-}
-`.trim();
-
-    const expectedInfo = `
-Expected (may be null):
-- expectedName: ${expectedName || 'null'}
-- expectedFatherName: ${expectedFatherName || 'null'}
-- expectedDob: ${expectedDob || 'null'}
-`.trim();
-
-    const userPrompt = `
-[OCR_FRONT]
-${frontText}
-
-[OCR_BACK]
-${backText}
-
-${expectedInfo}
-
-Now produce the JSON object described above.
-Do not include any explanation outside JSON.
-`.trim();
-
-    const generation = await hf.textGeneration({
-      model: HF_CHAT_MODEL,
-      inputs: `${systemPrompt}\n\nUser:\n${userPrompt}\n\nAssistant:`,
-      parameters: {
-        max_new_tokens: 512,
-        temperature: 0.2,
-        top_p: 0.9,
-      },
-    });
-
-    const rawOutput = generation?.generated_text ?? '';
-
-    const firstBrace = rawOutput.indexOf('{');
-    const lastBrace = rawOutput.lastIndexOf('}');
-
-    if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
-      console.error('verify-cnic: no JSON braces in LLM output:', rawOutput);
-      return res.status(500).json({
-        error: 'Failed to parse CNIC data from model output',
-        rawOutput,
-        ocrFront: frontText,
-        ocrBack: backText,
-      });
-    }
-
-    const jsonSubstring = rawOutput.slice(firstBrace, lastBrace + 1);
-
-    let parsed;
-    try {
-      parsed = JSON.parse(jsonSubstring);
-    } catch (e) {
-      console.error('verify-cnic: JSON.parse error:', e, jsonSubstring);
-      return res.status(500).json({
-        error: 'Failed to parse CNIC JSON from model output',
-        rawOutput,
-        jsonSubstring,
-        ocrFront: frontText,
-        ocrBack: backText,
-      });
-    }
-
-    // Store structured CNIC data under the current user for admin to review
-    try {
-      const uid = req.user && req.user.uid;
-      if (uid && parsed && parsed.cnicExtracted) {
-        const userRef = db.collection('users').doc(uid);
-        await userRef.set(
-          {
-            verification: {
-              cnic: {
-                extracted: parsed.cnicExtracted,
-                expectedMatches: parsed.expectedMatches || null,
-                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-              },
-            },
-          },
-          { merge: true },
-        );
-      }
-    } catch (storeErr) {
-      console.error('verify-cnic: failed to store CNIC data:', storeErr);
-      // continue; do not block response to client
-    }
-
-    // Success: send structured result plus raw OCR for debugging if needed
-    return res.json({
-      ...parsed,
-      raw: {
-        ocrFront: frontText,
-        ocrBack: backText,
-      },
-    });
+    return res.json(result);
   } catch (err) {
-    console.error('verify-cnic error:', err);
-    return res.status(500).json({
-      error: 'Internal error in verify-cnic',
-      details: err?.message ?? String(err),
-    });
+    console.error('CNIC error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. Face Verification
+app.post('/api/kyc/face', authMiddleware, async (req, res) => {
+  try {
+    const { cnicImage, selfieImage } = req.body;
+    if (!cnicImage || !selfieImage) {
+      return res.status(400).json({ error: 'cnicImage and selfieImage required' });
+    }
+
+    console.log("Verifying Face via Local Engine...");
+    const result = await runKycEngine('face', { image: cnicImage, image2: selfieImage });
+
+    return res.json(result);
+  } catch (err) {
+    console.error('Face verification error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. Shop/Tool Verification
+app.post('/api/kyc/shop', authMiddleware, async (req, res) => {
+  try {
+    const { shopImage } = req.body;
+    if (!shopImage) {
+      return res.status(400).json({ error: 'shopImage is required' });
+    }
+
+    console.log("Verifying Shop via Local Engine...");
+    const result = await runKycEngine('shop', { image: shopImage });
+
+    return res.json(result);
+  } catch (err) {
+    console.error('Shop verification error:', err);
+    return res.status(500).json({ error: err.message });
   }
 });
 // -------------------- Start Server --------------------
