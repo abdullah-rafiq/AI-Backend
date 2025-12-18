@@ -5,7 +5,7 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-lock.yaml
 #hf_cache/
-hf_kyc_space/
+
 # Env/config files (secrets)
 .env
 .env.local
