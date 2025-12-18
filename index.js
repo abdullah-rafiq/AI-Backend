@@ -34,6 +34,14 @@ function isReplyInLanguage(text, language) {
   return true;
 }
 
+function normalizeBase64(input) {
+  if (input == null) return input;
+  const s = String(input);
+  const commaIndex = s.indexOf(',');
+  const clean = commaIndex >= 0 ? s.slice(commaIndex + 1) : s;
+  return clean.replace(/\s/g, '');
+}
+
 // -------------------- Firebase Admin Initialization --------------------
 
 let serviceAccount;
@@ -142,7 +150,7 @@ async function requireAdminRole(req, res, next) {
 async function runKycEngine(action, args = {}) {
   const KYC_API_URL = process.env.KYC_API_URL;
   if (!KYC_API_URL) {
-    throw new Error("KYC_API_URL is not configured.");
+    throw new Error('KYC_API_URL is not configured on the server. Set KYC_API_URL in Render environment variables.');
   }
 
   // Map action to endpoint
@@ -151,13 +159,13 @@ async function runKycEngine(action, args = {}) {
 
   if (action === 'cnic') {
     endpoint = '/verify-cnic';
-    body = { image: args.image };
+    body = { image: normalizeBase64(args.image) };
   } else if (action === 'face') {
     endpoint = '/face-verify';
-    body = { image1: args.image, image2: args.image2 };
+    body = { image1: normalizeBase64(args.image), image2: normalizeBase64(args.image2) };
   } else if (action === 'shop') {
     endpoint = '/shop-verify';
-    body = { image: args.image };
+    body = { image: normalizeBase64(args.image) };
   } else {
     throw new Error(`Unknown action: ${action}`);
   }
@@ -402,6 +410,26 @@ async function callChatModel(systemPrompt, userContent) {
 
 app.get('/', (req, res) => {
   res.send('AI backend for GharAssist is running.');
+});
+
+app.get('/__version', (req, res) => {
+  res.json({
+    service: 'ai-backedn',
+    mode: 'kyc_bridge',
+    time: new Date().toISOString(),
+    env: {
+      hasKycApiUrl: Boolean(process.env.KYC_API_URL),
+      kycApiUrl: process.env.KYC_API_URL || null,
+      hasHfApiKey: Boolean(process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN),
+      hfChatModel: process.env.HF_CHAT_MODEL || null,
+      firebaseServiceAccountPath: process.env.FIREBASE_SERVICE_ACCOUNT_PATH || null,
+      hasFirebaseServiceAccountJson: Boolean(process.env.FIREBASE_SERVICE_ACCOUNT),
+    },
+    render: {
+      serviceId: process.env.RENDER_SERVICE_ID || null,
+      gitCommit: process.env.RENDER_GIT_COMMIT || null,
+    },
+  });
 });
 
 // -------------------- AI Endpoints --------------------
@@ -846,7 +874,7 @@ app.post('/api/vision/verify-cnic', authMiddleware, async (req, res) => {
     }
 
     console.log("Processing CNIC via Local Engine...");
-    const result = await runKycEngine('cnic', { image: cnicFrontBase64 });
+    const result = await runKycEngine('cnic', { image: normalizeBase64(cnicFrontBase64) });
 
     // Save to DB logic (preserving previous pattern of saving to user doc if needed)
     if (req.user && req.user.uid) {
@@ -866,7 +894,7 @@ app.post('/api/vision/verify-cnic', authMiddleware, async (req, res) => {
     return res.json(result);
   } catch (err) {
     console.error('CNIC error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'CNIC verification failed', details: err?.message ?? String(err) });
   }
 });
 
@@ -879,12 +907,12 @@ app.post('/api/kyc/face', authMiddleware, async (req, res) => {
     }
 
     console.log("Verifying Face via Local Engine...");
-    const result = await runKycEngine('face', { image: cnicImage, image2: selfieImage });
+    const result = await runKycEngine('face', { image: normalizeBase64(cnicImage), image2: normalizeBase64(selfieImage) });
 
     return res.json(result);
   } catch (err) {
     console.error('Face verification error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Face verification failed', details: err?.message ?? String(err) });
   }
 });
 
@@ -897,14 +925,15 @@ app.post('/api/kyc/shop', authMiddleware, async (req, res) => {
     }
 
     console.log("Verifying Shop via Local Engine...");
-    const result = await runKycEngine('shop', { image: shopImage });
+    const result = await runKycEngine('shop', { image: normalizeBase64(shopImage) });
 
     return res.json(result);
   } catch (err) {
     console.error('Shop verification error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Shop verification failed', details: err?.message ?? String(err) });
   }
 });
+
 // -------------------- Start Server --------------------
 
 const PORT = process.env.PORT || 8080;
