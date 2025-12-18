@@ -95,9 +95,6 @@ const HF_IMAGE_MODEL = process.env.HF_IMAGE_MODEL;
 // Sentiment model (optional, with chat fallback)
 const HF_SENTIMENT_MODEL = process.env.HF_SENTIMENT_MODEL;
 
-// OCR for CNIC
-const HF_OCR_MODEL = process.env.HF_OCR_MODEL;
-
 // Speech-to-text (e.g. openai/whisper-small)
 const HF_SPEECH_TO_TEXT_MODEL = process.env.HF_SPEECH_TO_TEXT_MODEL;
 
@@ -439,7 +436,7 @@ Language formats:
 
     let reply = await callChatModel(SUPPORT_SYSTEM_PROMPT, message);
 
-    // 🔒 Enforce language if model disobeys (retry once)
+    // Enforce language if model disobeys (retry once)
     if (!isReplyInLanguage(reply, language)) {
       const HARD_OVERRIDE_PROMPT = `
 You MUST reply ONLY in ${language}.
