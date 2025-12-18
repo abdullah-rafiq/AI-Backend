@@ -51,6 +51,38 @@ const authMiddleware = async (req, res, next) => {
   }
 };
 
+app.get('/__version', (req, res) => {
+  res.json({
+    service: 'ai-backedn',
+    mode: 'kyc_bridge',
+    time: new Date().toISOString(),
+    env: {
+      hasKycApiUrl: Boolean(process.env.KYC_API_URL && String(process.env.KYC_API_URL).trim().length > 0),
+      kycApiUrl: process.env.KYC_API_URL || null,
+      hasHfApiKey: Boolean(process.env.HUGGINGFACE_API_KEY && String(process.env.HUGGINGFACE_API_KEY).trim().length > 0),
+      hfChatModel: process.env.HF_CHAT_MODEL || null,
+      firebaseServiceAccountPath: process.env.FIREBASE_SERVICE_ACCOUNT_PATH || null,
+      hasFirebaseServiceAccountJson: Boolean(
+        process.env.FIREBASE_SERVICE_ACCOUNT && String(process.env.FIREBASE_SERVICE_ACCOUNT).trim().length > 0,
+      ),
+    },
+    render: {
+      serviceId: process.env.RENDER_SERVICE_ID || null,
+      gitCommit: process.env.RENDER_GIT_COMMIT || null,
+    },
+  });
+});
+
+app.get('/__auth_check', authMiddleware, (req, res) => {
+  res.json({
+    ok: true,
+    uid: req.user?.uid || null,
+    email: req.user?.email || null,
+    issuer: req.user?.iss || null,
+    audience: req.user?.aud || null,
+  });
+});
+
 // Python Bridge: runKycEngine
 async function runKycEngine(mode, data) {
   const apiUrl = process.env.KYC_API_URL;
