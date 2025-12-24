@@ -345,6 +345,31 @@ async function callChatModel(systemPrompt, userContent) {
   return String(content);
 }
 
+app.post('/ai/support/ask', authMiddleware, async (req, res) => {
+  try {
+    const { message, language } = req.body || {};
+    const text = String(message || '').trim();
+    if (!text) {
+      return res.status(400).json({ error: 'message is required' });
+    }
+
+    const lang = String(language || '').trim();
+    const systemPrompt = `You are the customer support assistant for the Assist app.
+Reply clearly and briefly.
+If you cannot help, ask the user to contact support@assist.com.
+Reply in ${lang || 'English'}.`;
+
+    const reply = await callChatModel(systemPrompt, text);
+    return res.json({ reply });
+  } catch (err) {
+    console.error('Support ask error:', err);
+    return res.status(500).json({
+      error: 'Support request failed',
+      details: err?.message ?? String(err),
+    });
+  }
+});
+
 async function extractCnicWithChatModel({ frontLines = [], backLines = [], expectedName, expectedFatherName, expectedDob }) {
   const systemPrompt = `You are a data extraction engine for Pakistan CNIC OCR results.
 Return ONLY valid JSON.
