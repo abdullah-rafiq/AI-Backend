@@ -7,10 +7,19 @@ const { spawn } = require('child_process');
 const path = require('path');
 require('dotenv').config();
 const app = express();
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ limit: '20mb', extended: true }));
+app.use(express.json({ limit: '30mb' }));
+app.use(express.urlencoded({ limit: '30mb', extended: true }));
 app.use(cors());
-app.use(express.json());
+
+app.use((err, req, res, next) => {
+  if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+    return res.status(413).json({
+      error: 'Payload too large. Reduce image size or increase server body limit.',
+      errorCode: 'PAYLOAD_TOO_LARGE',
+    });
+  }
+  return next(err);
+});
 
 const firebaseServiceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT;
 const firebaseServiceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
@@ -90,6 +99,7 @@ async function runKycEngine(mode, data) {
     let endpoint = null;
     if (mode === 'cnic') endpoint = '/verify-cnic';
     if (mode === 'face') endpoint = '/face-verify';
+    if (mode === 'liveness') endpoint = '/face-liveness';
     if (mode === 'shop') endpoint = '/shop-verify';
     if (!endpoint) throw new Error(`Unknown KYC mode: ${mode}`);
 
@@ -207,12 +217,22 @@ function faceCnicMatch({ faceResult, cnic }) {
   const faceGender = normalizeGender(faceResult?.gender);
   const cnicGender = inferGenderFromCnicName(cnic?.fullName);
 
+  const distance = typeof faceResult?.distance === 'number'
+    ? faceResult.distance
+    : (typeof faceResult?.similarity === 'number' ? faceResult.similarity : null);
+  const threshold = typeof faceResult?.threshold === 'number' ? faceResult.threshold : null;
+  const similarityOk = faceResult?.verified === true
+    ? true
+    : (distance != null && threshold != null)
+      ? distance <= threshold
+      : (distance != null ? distance < 0.35 : null);
+
   return {
     faceVerified: faceResult?.verified === true,
     genderMatch: faceGender && cnicGender
       ? faceGender === cnicGender
       : null,
-    similarityOk: faceResult?.distance < 0.35,
+    similarityOk,
   };
 }
 
@@ -232,12 +252,13 @@ function isCnicExpired(expiryDate) {
 function antiSpoofingHeuristics(faceResult) {
   let score = 0;
 
-  if (faceResult?.confidence > 0.85) score += 0.4;
-  if (faceResult?.sharpness > 0.6) score += 0.3;
-  if (faceResult?.reflectionDetected === false) score += 0.2;
-  if (faceResult?.multipleFaces === false) score += 0.1;
+  if (faceResult?.verified === true) score += 0.6;
+  if (faceResult?.confidence > 0.85) score += 0.25;
+  if (faceResult?.sharpness > 0.6) score += 0.1;
+  if (faceResult?.reflectionDetected === false) score += 0.03;
+  if (faceResult?.multipleFaces === false) score += 0.02;
 
-  return Number(score.toFixed(2));
+  return Number(Math.min(1.0, score).toFixed(2));
 }
 
 function findLabeledValue(keywords, lines) {
@@ -655,13 +676,29 @@ app.post('/api/kyc/face', authMiddleware, async (req, res) => {
     const matchResult = faceCnicMatch({ faceResult, cnic: cnicData });
 
     // Anti-Spoofing
-    const spoofScore = antiSpoofingHeuristics(faceResult);
+    let livenessResult = null;
+    try {
+      livenessResult = await runKycEngine('liveness', { image: normalizeBase64(selfieImage) });
+    } catch (e) {
+      console.warn('Liveness check failed (fallback to heuristics):', e?.message ?? String(e));
+    }
+
+    const livenessScore = typeof livenessResult?.livenessScore === 'number'
+      ? livenessResult.livenessScore
+      : (typeof livenessResult?.spoofScore === 'number' ? livenessResult.spoofScore : null);
+
+    const spoofScore = typeof livenessScore === 'number'
+      ? livenessScore
+      : antiSpoofingHeuristics(faceResult);
     let status = 'auto_verified';
 
-    if (spoofScore < 0.6) {
+    const minLiveness = Number.parseFloat(process.env.FACE_LIVENESS_MIN || '0.6');
+    const livenessMin = Number.isFinite(minLiveness) ? minLiveness : 0.6;
+
+    if (spoofScore < livenessMin) {
       status = 'needs_manual_review_spoof_risk';
     }
-    if (!matchResult.similarityOk) {
+    if (matchResult.similarityOk === false) {
       status = 'rejected_face_mismatch';
     }
 
@@ -677,10 +714,17 @@ app.post('/api/kyc/face', authMiddleware, async (req, res) => {
       await db.collection('users').doc(req.user.uid).set({
         verification: {
           face: {
+            status,
             verified: faceResult.verified,
             similarity: faceResult.distance,
+            distance: faceResult.distance,
+            threshold: faceResult.threshold,
+            confidence: faceResult.confidence,
             gender: faceResult.gender,
             spoofScore,
+            livenessScore: typeof livenessScore === 'number' ? livenessScore : null,
+            isReal: typeof livenessResult?.isReal === 'boolean' ? livenessResult.isReal : null,
+            spoofModel: livenessResult?.spoofModel ?? null,
             match: matchResult,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           },
@@ -692,7 +736,10 @@ app.post('/api/kyc/face', authMiddleware, async (req, res) => {
     return res.json(finalResult);
   } catch (err) {
     console.error('Face verification error:', err);
-    return res.status(500).json({ error: 'Face verification failed', details: err?.message ?? String(err) });
+    return res.status(500).json({
+      error: 'Face verification failed',
+      details: err?.message ?? String(err),
+    });
   }
 });
 
@@ -706,6 +753,32 @@ app.post('/api/kyc/shop', authMiddleware, async (req, res) => {
 
     console.log("Verifying Shop via Local Engine...");
     const result = await runKycEngine('shop', { image: normalizeBase64(shopImage) });
+
+    const status = typeof result?.status === 'string'
+      ? result.status
+      : (typeof result?.score === 'number'
+        ? (result.score >= 0.6 ? 'auto_verified' : 'needs_manual_review')
+        : null);
+
+    if (req.user && req.user.uid) {
+      await db.collection('users').doc(req.user.uid).set({
+        verification: {
+          shop: {
+            status,
+            score: typeof result?.score === 'number' ? result.score : null,
+            shape: result?.shape ?? null,
+            detected_objects: result?.detected_objects ?? result?.detectedObjects ?? null,
+            tools: result?.tools ?? null,
+            text_content: result?.text_content ?? result?.textContent ?? result?.ocrText ?? null,
+            notes: result?.notes ?? null,
+            topService: result?.topService ?? null,
+            serviceCandidates: result?.serviceCandidates ?? null,
+            serviceHints: result?.serviceHints ?? null,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+        }
+      }, { merge: true });
+    }
 
     return res.json(result);
   } catch (err) {
